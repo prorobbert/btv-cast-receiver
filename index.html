@@ -4,72 +4,22 @@
     <meta charset="utf-8" />
     <title>Budget Thuis TV — Cast receiver</title>
 
-    <!--
-      Both SDK scripts come from gstatic, never from this origin. Self-hosting them is what killed the
-      previous receiver: nginx served the copies as text/plain, Chromium refused to execute them with
-      nosniff set, `cast` stayed undefined and every session died on the ~60s CastInitTimeout watchdog.
-    -->
-    <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
-    <script src="https://www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
+    <link rel="stylesheet" href="styles.css" media="screen" />
 
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Londrina+Solid:wght@400&family=Open+Sans:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
-
-    <link rel="stylesheet" href="styles.css" />
+    <!-- Loaded from gstatic, never self-hosted: self-hosted copies served as text/plain are what killed
+         the previous receiver on the ~60s CastInitTimeout watchdog. -->
+    <script src="//www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+    <script src="//www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
   </head>
 
-  <!-- Nothing is playing until a load request says otherwise, so the logo screen is the starting state. -->
-  <body data-state="logo" data-ui="shown">
-    <!--
-      The SDK's own player element: it owns the media element, which is what keeps playback smooth — a
-      custom MediaElement cost us "many benefits of using Web Receiver SDK", visibly. Its shadow root is
-      open, so receiver.js hides the chrome inside it (background, logo, spinner, splash, slideshow and
-      the platform's <tv-overlay-placeholder>) and only the video remains. See styleCastPlayer().
-    -->
+  <body>
+    <!-- The SDK's built-in player and its UI. Styled with the documented CSS custom properties in
+         styles.css; no custom DOM, so the platform's own controls integrate as designed. -->
     <cast-media-player></cast-media-player>
 
-    <div id="overlay" aria-hidden="true">
-      <!-- Every state without a picture: launching, idle, stopped, errors. -->
-      <section class="logoScreen">
-        <img src="assets/logo.svg" alt="Budget Thuis" />
-        <!-- Which build is actually on the device. Stamped by deploy.sh; hidden when unstamped. -->
-        <p class="logoScreen__build" id="build"></p>
-      </section>
-
-      <!-- The design's scrim: barely-there at the top, solid surface colour at the bottom. -->
-      <div class="scrim"></div>
-
-      <!-- Transport state, dead centre of the picture, exactly as the STB player draws it. -->
-      <div class="control">
-        <span class="control__glyph"></span>
-      </div>
-
-      <div class="hud">
-        <div class="hud__info">
-          <div class="hud__channel"><img id="artwork" alt="" /></div>
-          <div class="hud__label">
-            <p class="hud__title" id="title"></p>
-            <p class="hud__subtitle" id="subtitle"></p>
-          </div>
-        </div>
-
-        <div class="hud__seeker">
-          <span class="hud__time" id="position">--:--</span>
-          <div class="bar">
-            <div class="bar__buffer" id="buffer"></div>
-            <div class="bar__progress" id="progress"></div>
-            <div class="bar__handle" id="handle"></div>
-          </div>
-          <span class="hud__time hud__time--end" id="duration">--:--</span>
-        </div>
-      </div>
-    </div>
-
-    <script src="version.js"></script>
-    <script src="receiver.js"></script>
+    <footer>
+      <script src="version.js"></script>
+      <script src="receiver.js"></script>
+    </footer>
   </body>
 </html>
