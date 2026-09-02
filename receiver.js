@@ -143,6 +143,7 @@ function setState(state) {
   body.dataset.state = state;
   showChrome();
   if (state === State.Playing) armChromeFade();
+  if (state === State.Paused) dumpOverlayDiagnostics("paused");
 
   clearTimeout(pausedDisconnectTimer);
   if (state === State.Paused) {
@@ -275,6 +276,7 @@ function bufferedEndFor(position) {
 }
 
 let seekingTicks = 0;
+let bufferingSince = 0;
 
 function resolveState(data) {
   /*
@@ -283,10 +285,24 @@ function resolveState(data) {
    * holds the flag across ticks and still reads as seeking.
    */
   seekingTicks = data.isSeeking ? seekingTicks + 1 : 0;
+  if (data.state !== PlayerState.Buffering) bufferingSince = 0;
   if (seekingTicks >= 2) return State.Seeking;
   if (data.state === PlayerState.Playing) return State.Playing;
   if (data.state === PlayerState.Paused) return State.Paused;
-  if (data.state === PlayerState.Buffering) return State.Buffering;
+  if (data.state === PlayerState.Buffering) {
+    /*
+     * Live playback flaps PLAYING<->BUFFERING around the edge. Surfacing every flap re-showed the
+     * chrome each time, so it never reached its five quiet seconds — and the checklist wants a
+     * buffering indicator only after a few seconds anyway. A rebuffer straight from playing stays
+     * invisible for 1.5s; the very first buffer (nothing played yet) still shows immediately.
+     */
+    if (!bufferingSince) bufferingSince = Date.now();
+    const previous = body.dataset.state;
+    const briefly = Date.now() - bufferingSince < 1500;
+    if (briefly && (previous === State.Playing || previous === State.Paused)) return previous;
+    return State.Buffering;
+  }
+  bufferingSince = 0;
 
   /*
    * Anything else — IDLE, LOADING, a value this build does not know — means the receiver is not
@@ -408,6 +424,30 @@ function suppressPlatformControls() {
   }
 }
 
+/**
+ * One log line that settles where the pause overlay comes from. If `shadowTvOverlay` exists with
+ * display none while the overlay is still visible on screen, the platform draws it natively outside
+ * the page — no receiver CSS can touch it, and suppression has to come from the platform APIs or be
+ * accepted. If it exists with any other display, our stylesheet lost.
+ */
+function dumpOverlayDiagnostics(reason) {
+  try {
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const controls = cast.framework.ui.Controls.getInstance();
+    const root = document.querySelector("cast-media-player")?.shadowRoot;
+    const overlay = root && root.querySelector("tv-overlay");
+    log(`overlay diagnostics (${reason})`, {
+      mediaControlsState: typeof context.getMediaControlsState === "function" ? context.getMediaControlsState() : "?",
+      hasMediaControlsOverlay:
+        typeof controls.hasMediaControlsOverlay === "function" ? controls.hasMediaControlsOverlay() : "?",
+      shadowTvOverlay: overlay ? getComputedStyle(overlay).display : "absent",
+      ourStyleTag: Boolean(root && root.getElementById("btv-shadow-styles")),
+    });
+  } catch (error) {
+    logError("overlay diagnostics failed", error);
+  }
+}
+
 function styleCastPlayer() {
   const player = document.querySelector("cast-media-player");
   const root = player && player.shadowRoot;
@@ -516,6 +556,7 @@ function startReceiver(debugRequested) {
 
       applyDrmConfiguration(playerManager, request);
       resolveLiveStartPosition(request);
+      suppressPlatformControls();
 
       mediaRequested = true;
       setState(State.Buffering); // a picture is on its way, so do not cover it with the logo
@@ -548,7 +589,10 @@ function startReceiver(debugRequested) {
   });
 
   // The platform announces its overlay too; log it so a stray overlay is attributable.
-  context.addEventListener("showmediacontrols", event => log("platform requested media controls", event));
+  context.addEventListener("showmediacontrols", event => {
+    log("platform requested media controls", { state: event && event.mediaControlsState });
+    dumpOverlayDiagnostics("showmediacontrols");
+  });
 
   context.addEventListener(system.EventType.SENDER_CONNECTED, event => log("sender connected", event.senderId));
   context.addEventListener(system.EventType.SENDER_DISCONNECTED, event =>
