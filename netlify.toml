@@ -1,0 +1,16 @@
+# The receiver is three static files plus assets — nothing to build.
+[build]
+  publish = "."
+
+# The Cast console allows one url per application id, so always deploy to the site's production url
+# (`netlify deploy --prod`) rather than a per-deploy draft url the registered id would not point at.
+[[headers]]
+  for = "/*"
+  [headers.values]
+    # The receiver page itself must never be cached: iterating means reloading it on the device.
+    Cache-Control = "no-store"
+
+[[headers]]
+  for = "/assets/*"
+  [headers.values]
+    Cache-Control = "public, max-age=3600"

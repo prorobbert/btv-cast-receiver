@@ -1,0 +1,39 @@
+# Publishes the receiver to GitHub Pages on every push to main, stamping version.js first so the
+# build line under the logo always names the commit a device is actually running.
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Stamp version.js
+        run: |
+          stamped=$(TZ=Europe/Amsterdam date "+%Y-%m-%d %H:%M")
+          commit=$(git rev-parse --short HEAD)
+          printf 'window.BTV_BUILD = { stamped: "%s", commit: "%s" };\n' "$stamped" "$commit" > version.js
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: .
+      - id: deployment
+        uses: actions/deploy-pages@v4

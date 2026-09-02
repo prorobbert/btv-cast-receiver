@@ -1,0 +1,319 @@
+/*
+ * Geometry and colour come straight off the STB design board (960x540, node 14027:9824 in the master
+ * file): the HUD spans x=58..902 with its top edge at y=410, the transport control is a 56px circle
+ * dead centre, the bar is 5px with a 2px radius. Every measurement below is that value over 960 or
+ * 540, so the layout holds at 1280x720 and 1920x1080 alike.
+ */
+:root {
+  --btv-green: #3aaa35; /* ui/primary/primary */
+  --btv-black: #0e0e0e; /* surface/background */
+  --btv-title: #efefef; /* text/text-white */
+  --btv-help: rgba(255, 255, 255, 0.7); /* text/text-help */
+  --btv-track: #fafafa; /* surface/inverse-surface */
+  --btv-buffer: rgba(28, 28, 28, 0.4); /* border/border-black 40% */
+  --btv-control: #43474e; /* the FAB's ellipse fill */
+
+  --inset: 6.042%; /* 58/960 */
+  --control-size: 5.833vw; /* 56/960 */
+
+  /* Budget TV/dark/4 — the shadow pair the design puts on the control and the handle. */
+  --btv-shadow: 0 0.37vh 0.56vh rgba(28, 28, 28, 0.3), 0 1.11vh 1.85vh rgba(28, 28, 28, 0.15);
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--btv-black);
+  color: var(--btv-title);
+  font-family: "Open Sans", "Helvetica Neue", Arial, sans-serif;
+}
+
+/*
+ * The picture. Everything inside the element lives in a shadow root, so these rules only place the
+ * element itself — receiver.js styles its contents from the inside (styleCastPlayer).
+ */
+cast-media-player {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  background: var(--btv-black);
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1; /* above the picture */
+  pointer-events: none; /* the receiver is never touched; input arrives as media messages */
+}
+
+/* --- the logo screen ------------------------------------------------------------------------- */
+
+.logoScreen {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  gap: 3vh;
+  align-items: center;
+  justify-content: center;
+  background: var(--btv-black);
+}
+
+body[data-state="logo"] .logoScreen {
+  display: flex;
+}
+
+.logoScreen img {
+  width: 20.8%; /* 200/960, the size the logo has on the design board */
+  height: auto;
+}
+
+/* Deliberately faint: a developer aid, not part of the design. Disappears on an unstamped build. */
+.logoScreen__build {
+  margin: 0;
+  font-size: 1.25vw;
+  letter-spacing: 0.08em;
+  color: #4a4a4a;
+}
+
+.logoScreen__build:empty {
+  display: none;
+}
+
+/* --- playback chrome: scrim, control, HUD ----------------------------------------------------- */
+
+/*
+ * One switch hides all three: the design shows the full chrome on a state change and none of it while
+ * playback simply runs. receiver.js flips data-ui after five undisturbed playing seconds.
+ */
+.scrim,
+.control,
+.hud {
+  display: none;
+  opacity: 1;
+  transition: opacity 400ms ease;
+}
+
+body[data-state="playing"] .scrim,
+body[data-state="playing"] .control,
+body[data-state="playing"] .hud,
+body[data-state="paused"] .scrim,
+body[data-state="paused"] .control,
+body[data-state="paused"] .hud,
+body[data-state="seeking"] .scrim,
+body[data-state="seeking"] .control,
+body[data-state="seeking"] .hud,
+body[data-state="buffering"] .scrim,
+body[data-state="buffering"] .control,
+body[data-state="buffering"] .hud {
+  display: block;
+}
+
+body[data-ui="hidden"] .scrim,
+body[data-ui="hidden"] .control,
+body[data-ui="hidden"] .hud {
+  opacity: 0;
+}
+
+/* The design's scrim: rgba(14,14,14,0.1) at the top running to solid surface colour at the bottom. */
+.scrim {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(to bottom, rgba(14, 14, 14, 0.1) 0%, var(--btv-black) 100%);
+}
+
+/* --- transport control ------------------------------------------------------------------------ */
+
+.control {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: var(--control-size);
+  height: var(--control-size);
+  border-radius: 50%;
+  background: var(--btv-control);
+  box-shadow: var(--btv-shadow);
+}
+
+.control__glyph {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Play: a triangle, drawn rather than shipped so it scales with the control. */
+body[data-state="playing"] .control__glyph::before,
+body[data-state="seeking"] .control__glyph::before {
+  content: "";
+  margin-left: 8%;
+  border-left: calc(var(--control-size) * 0.28) solid #fff;
+  border-top: calc(var(--control-size) * 0.17) solid transparent;
+  border-bottom: calc(var(--control-size) * 0.17) solid transparent;
+}
+
+/* Pause: two bars. */
+body[data-state="paused"] .control__glyph::before {
+  content: "";
+  width: calc(var(--control-size) * 0.3);
+  height: calc(var(--control-size) * 0.34);
+  border-left: calc(var(--control-size) * 0.1) solid #fff;
+  border-right: calc(var(--control-size) * 0.1) solid #fff;
+  box-sizing: border-box;
+}
+
+/* Buffering: the control becomes the spinner, so the picture keeps one focal point. */
+body[data-state="buffering"] .control {
+  background: none;
+  box-shadow: none;
+}
+
+body[data-state="buffering"] .control__glyph::before {
+  content: "";
+  width: 100%;
+  height: 100%;
+  border: calc(var(--control-size) * 0.09) solid rgba(255, 255, 255, 0.2);
+  border-top-color: #fff;
+  border-radius: 50%;
+  box-sizing: border-box;
+  animation: spin 900ms linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* --- the HUD ---------------------------------------------------------------------------------- */
+
+.hud {
+  position: absolute;
+  left: var(--inset);
+  right: var(--inset);
+  top: 75.9%; /* 410/540 */
+}
+
+.hud__info {
+  display: flex;
+  align-items: flex-end;
+  gap: 1.667vw; /* 16/960 */
+  height: 11.85vh; /* 64/540 */
+}
+
+/* The channel logo slot: 56x56 with the design's 4px/12px padding, so wide marks keep their ratio. */
+.hud__channel {
+  flex: 0 0 auto;
+  width: var(--control-size);
+  height: var(--control-size);
+  padding: 2.22vh 0.417vw; /* 12/540, 4/960 */
+  box-sizing: border-box;
+  display: none;
+  align-self: center;
+}
+
+.hud__channel img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+body[data-has-artwork="true"] .hud__channel {
+  display: block;
+}
+
+.hud__label {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 0.74vh; /* 4/540 */
+}
+
+.hud__title {
+  margin: 0;
+  font-family: "Londrina Solid", "Open Sans", sans-serif;
+  font-weight: 400;
+  font-size: 2.5vw; /* 24/960 */
+  line-height: 1.333; /* 32/24 */
+  color: var(--btv-title);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud__subtitle {
+  margin: 0;
+  font-size: 1.667vw; /* 16/960 */
+  line-height: 1.5; /* 24/16 */
+  letter-spacing: 0.026em; /* 0.25/16 */
+  color: var(--btv-help);
+  opacity: 0.8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.hud__seeker {
+  display: flex;
+  align-items: center;
+  gap: 0.417vw; /* 4/960 */
+  margin-top: 2.96vh; /* 16/540 */
+}
+
+.hud__time {
+  flex: 0 0 auto;
+  width: 5vw; /* 48/960 */
+  font-size: 1.25vw; /* 12/960 */
+  line-height: 1.333;
+  letter-spacing: 0.02em;
+  color: #fff;
+  opacity: 0.8;
+  font-variant-numeric: tabular-nums;
+}
+
+.hud__time--end {
+  text-align: right;
+  margin-left: 0.417vw; /* the design's extra 4px before the end time */
+}
+
+.bar {
+  position: relative;
+  flex: 1 1 auto;
+  height: 0.926vh; /* 5/540 */
+  border-radius: 0.37vh; /* 2/540 */
+  background: var(--btv-track);
+}
+
+.bar__buffer,
+.bar__progress {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+}
+
+.bar__buffer {
+  background: var(--btv-buffer);
+}
+
+.bar__progress {
+  background: var(--btv-green);
+}
+
+.bar__handle {
+  position: absolute;
+  top: 50%;
+  left: 0;
+  width: 2.96vh; /* 16/540 */
+  height: 2.96vh;
+  margin: -1.48vh 0 0 -1.48vh;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: var(--btv-shadow);
+}
