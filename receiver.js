@@ -110,23 +110,39 @@ let mediaRequested = false;
  */
 let uiHideTimer = null;
 
-function showChrome(state) {
+function showChrome() {
   body.dataset.ui = "shown";
   clearTimeout(uiHideTimer);
-  if (state === State.Playing) {
-    uiHideTimer = setTimeout(() => (body.dataset.ui = "hidden"), 5000);
-  }
+  uiHideTimer = null;
+}
+
+/**
+ * Arms the fade once and leaves it armed: rendering runs on every PlayerData tick — a second at most
+ * between them — and a timer that any tick can reset never fires. The timer checks the state again
+ * when it lands, so a pause during the five seconds keeps the chrome up.
+ */
+function armChromeFade() {
+  if (uiHideTimer) return;
+  uiHideTimer = setTimeout(() => {
+    uiHideTimer = null;
+    if (body.dataset.state === State.Playing) {
+      body.dataset.ui = "hidden";
+      log("chrome hidden after undisturbed playback");
+    }
+  }, 5000);
 }
 
 function setState(state) {
   if (body.dataset.state === state) {
-    if (state !== State.Playing && body.dataset.ui !== "shown") showChrome(state);
+    if (state === State.Playing) armChromeFade();
+    else if (body.dataset.ui !== "shown") showChrome();
     return;
   }
 
   log(`state ${body.dataset.state} → ${state}`);
   body.dataset.state = state;
-  showChrome(state);
+  showChrome();
+  if (state === State.Playing) armChromeFade();
 
   clearTimeout(pausedDisconnectTimer);
   if (state === State.Paused) {
@@ -258,8 +274,16 @@ function bufferedEndFor(position) {
   }
 }
 
+let seekingTicks = 0;
+
 function resolveState(data) {
-  if (data.isSeeking) return State.Seeking;
+  /*
+   * isSeeking can flicker for a single PlayerData tick during live playback (the SDK's own live-edge
+   * corrections). One tick must not re-show the chrome, or it never fades; a viewer-initiated seek
+   * holds the flag across ticks and still reads as seeking.
+   */
+  seekingTicks = data.isSeeking ? seekingTicks + 1 : 0;
+  if (seekingTicks >= 2) return State.Seeking;
   if (data.state === PlayerState.Playing) return State.Playing;
   if (data.state === PlayerState.Paused) return State.Paused;
   if (data.state === PlayerState.Buffering) return State.Buffering;
@@ -352,12 +376,37 @@ function resolveLiveStartPosition(request) {
  * screen on pause.
  */
 const ShadowStyles = `
-  .background, .logo, .spinner, .splash, .slideshow, tv-overlay-placeholder {
+  /*
+   * tv-overlay is included alongside its placeholder deliberately: the platform *replaces* the
+   * placeholder with a live <tv-overlay> element when it wants to draw its media controls, so hiding
+   * only the placeholder stops mattering the moment the overlay actually appears. A stylesheet in the
+   * shadow root matches elements created later, which is what makes this hold.
+   */
+  .background, .logo, .spinner, .splash, .slideshow, tv-overlay-placeholder, tv-overlay {
     display: none !important;
   }
   #castPlayer, .foreground { background: #0e0e0e !important; }
   .mediaElement { object-fit: contain !important; }
 `;
+
+/**
+ * Asks the platform outright not to draw its media-controls overlay. `ui.Controls` carries the levers
+ * for the Google TV overlay (`setDcVisibility`, `setScrubberVisibility`); hiding <tv-overlay> in the
+ * shadow root is the belt, this is the braces. All guarded — the API surface varies per device
+ * generation and none of it may break playback.
+ */
+function suppressPlatformControls() {
+  try {
+    const controls = cast.framework.ui.Controls.getInstance();
+    if (typeof controls.setDcVisibility === "function") controls.setDcVisibility(false);
+    if (typeof controls.setScrubberVisibility === "function") controls.setScrubberVisibility(false);
+    log("platform controls suppressed", {
+      hasOverlay: typeof controls.hasMediaControlsOverlay === "function" ? controls.hasMediaControlsOverlay() : "?",
+    });
+  } catch (error) {
+    logError("could not suppress platform controls", error);
+  }
+}
 
 function styleCastPlayer() {
   const player = document.querySelector("cast-media-player");
@@ -494,8 +543,12 @@ function startReceiver(debugRequested) {
     log("receiver ready", { build: build.stamped || "unstamped", commit: build.commit || "-" });
     startDebugLogger(debugRequested);
     styleCastPlayer();
+    suppressPlatformControls();
     setState(State.Logo);
   });
+
+  // The platform announces its overlay too; log it so a stray overlay is attributable.
+  context.addEventListener("showmediacontrols", event => log("platform requested media controls", event));
 
   context.addEventListener(system.EventType.SENDER_CONNECTED, event => log("sender connected", event.senderId));
   context.addEventListener(system.EventType.SENDER_DISCONNECTED, event =>
