@@ -317,3 +317,25 @@ body[data-has-artwork="true"] .hud__channel {
   background: #fff;
   box-shadow: var(--btv-shadow);
 }
+
+/* --- self-rendered debug panel (see receiver.js) ---------------------------------------------- */
+
+#btv-debug {
+  position: fixed;
+  top: 1vh;
+  left: 1vw;
+  max-width: 60vw;
+  max-height: 96vh;
+  overflow: hidden;
+  margin: 0;
+  padding: 1vh 1vw;
+  z-index: 9999;
+  background: rgba(0, 0, 0, 0.8);
+  color: #7CFC7C;
+  font-family: "Courier New", monospace;
+  font-size: 1.4vh;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  pointer-events: none;
+}

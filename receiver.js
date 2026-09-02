@@ -45,10 +45,37 @@ const PausedDisconnectMs = 20 * 60 * 1000;
 
 const LogTag = "BTV";
 
+/*
+ * A debug panel we render ourselves.
+ *
+ * The SDK's CastDebugLogger overlay never appeared on the Google TV Streamer — CaC's HIDE button was
+ * lit but the TV showed nothing, and no BTV tag reached CaC either, so the whole SDK debug path is
+ * dead on this device. This panel owes it nothing: a plain fixed element in our own DOM, printing the
+ * last lines of log(). Gated behind ?debug=1 or customData.debug so it never ships on by default.
+ */
+const debugLines = [];
+let debugPanel = null;
+
+function pushDebugLine(line) {
+  debugLines.push(line);
+  if (debugLines.length > 30) debugLines.shift();
+  if (debugPanel) debugPanel.textContent = debugLines.join("\n");
+}
+
+function showDebugPanel() {
+  body.dataset.debug = "true";
+  if (debugPanel) return;
+  debugPanel = document.createElement("pre");
+  debugPanel.id = "btv-debug";
+  debugPanel.textContent = debugLines.join("\n");
+  document.body.appendChild(debugPanel);
+}
+
 /** Loud version of `log`, so a swallowed exception still reaches the CaC tool and the overlay. */
 function logError(message, error) {
   try {
     console.error(`[btv] ${message}`, error);
+    pushDebugLine(`ERROR ${message}: ${error && error.message ? error.message : error}`);
     const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
     if (logger) logger.error(LogTag, `${message}: ${error && error.message ? error.message : error}`);
   } catch (nested) {
@@ -75,7 +102,6 @@ function log(message, detail) {
     else console.log(`[btv] ${message}`, detail);
 
     const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
-    if (!logger) return;
 
     let text = message;
     try {
@@ -83,9 +109,14 @@ function log(message, detail) {
     } catch (error) {
       text = `${message} <undescribable detail>`;
     }
-    logger.info(LogTag, text);
+    if (logger) logger.info(LogTag, text);
   } catch (error) {
     // Nothing to do: there is by definition no way to report a failure in the reporting path.
+  }
+  try {
+    pushDebugLine(detail === undefined ? message : `${message} ${JSON.stringify(detail)}`);
+  } catch (error) {
+    pushDebugLine(message);
   }
 }
 
@@ -491,27 +522,36 @@ function styleCastPlayerWhenReady(attemptsLeft = 40) {
  * `customData.debug`: it covers the UI it is meant to help evaluate.
  */
 function startDebugLogger(overlayRequested) {
-  const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
-  if (!logger) return;
-
-  logger.setEnabled(true);
-  logger.loggerLevelByEvents = {
-    "cast.framework.events.category.CORE": cast.framework.LoggerLevel.INFO,
-    "cast.framework.events.EventType.MEDIA_STATUS": cast.framework.LoggerLevel.DEBUG,
-  };
-  logger.loggerLevelByTags = { [LogTag]: cast.framework.LoggerLevel.DEBUG };
-
-  if (overlayRequested) showDebugOverlay();
+  if (overlayRequested) showDebugPanel(); // ours first — it does not depend on the SDK logger
+  try {
+    const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
+    if (!logger) return;
+    logger.setEnabled(true);
+    logger.loggerLevelByEvents = {
+      "cast.framework.events.category.CORE": cast.framework.LoggerLevel.INFO,
+      "cast.framework.events.EventType.MEDIA_STATUS": cast.framework.LoggerLevel.DEBUG,
+    };
+    logger.loggerLevelByTags = { [LogTag]: cast.framework.LoggerLevel.DEBUG };
+    if (overlayRequested) showDebugOverlay();
+  } catch (error) {
+    // The SDK logger is a nice-to-have; our panel is the one that actually paints. Never let this
+    // throw — it runs inside the READY handler, and a throw there aborted styling and suppression.
+    logError("SDK debug logger unavailable", error);
+  }
 }
 
 /** Draws the log on the television. Only on request — it covers the picture. */
 function showDebugOverlay() {
-  const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
-  if (!logger || body.dataset.debug === "true") return;
-
-  logger.setEnabled(true);
-  logger.showDebugLogs(true);
-  body.dataset.debug = "true";
+  showDebugPanel();
+  try {
+    const logger = window.cast?.debug?.CastDebugLogger?.getInstance?.();
+    if (logger) {
+      logger.setEnabled(true);
+      logger.showDebugLogs(true);
+    }
+  } catch (error) {
+    logError("could not show the SDK debug overlay", error);
+  }
   log("debug overlay enabled");
 }
 
@@ -667,6 +707,7 @@ const PreviewData = {
 function startPreview(state) {
   log(`preview mode: ${state}`);
   body.dataset.preview = "true";
+  if (params.get("debug") === "1") showDebugPanel();
 
   const data = PreviewData[state];
   if (data) renderPlayerData(data);
