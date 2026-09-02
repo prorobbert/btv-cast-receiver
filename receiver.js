@@ -174,7 +174,7 @@ function setState(state) {
   body.dataset.state = state;
   showChrome();
   if (state === State.Playing) armChromeFade();
-  if (state === State.Paused) dumpOverlayDiagnostics("paused");
+  dumpOverlayDiagnostics(state);
 
   clearTimeout(pausedDisconnectTimer);
   if (state === State.Paused) {
@@ -317,9 +317,9 @@ function resolveState(data) {
    */
   seekingTicks = data.isSeeking ? seekingTicks + 1 : 0;
   if (data.state !== PlayerState.Buffering) bufferingSince = 0;
+  if (data.state === PlayerState.Paused) return State.Paused;
   if (seekingTicks >= 2) return State.Seeking;
   if (data.state === PlayerState.Playing) return State.Playing;
-  if (data.state === PlayerState.Paused) return State.Paused;
   if (data.state === PlayerState.Buffering) {
     /*
      * Live playback flaps PLAYING<->BUFFERING around the edge. Surfacing every flap re-showed the
@@ -467,12 +467,14 @@ function dumpOverlayDiagnostics(reason) {
     const controls = cast.framework.ui.Controls.getInstance();
     const root = document.querySelector("cast-media-player")?.shadowRoot;
     const overlay = root && root.querySelector("tv-overlay");
-    log(`overlay diagnostics (${reason})`, {
-      mediaControlsState: typeof context.getMediaControlsState === "function" ? context.getMediaControlsState() : "?",
-      hasMediaControlsOverlay:
-        typeof controls.hasMediaControlsOverlay === "function" ? controls.hasMediaControlsOverlay() : "?",
+    const overlayApi = typeof controls.hasMediaControlsOverlay === "function"
+      ? JSON.stringify(controls.hasMediaControlsOverlay())
+      : "?";
+    log(`overlay diag ${reason}`, {
+      mcState: typeof context.getMediaControlsState === "function" ? context.getMediaControlsState() : "?",
+      overlayApi,
       shadowTvOverlay: overlay ? getComputedStyle(overlay).display : "absent",
-      ourStyleTag: Boolean(root && root.getElementById("btv-shadow-styles")),
+      styled: Boolean(root && root.getElementById("btv-shadow-styles")),
     });
   } catch (error) {
     logError("overlay diagnostics failed", error);
