@@ -215,8 +215,11 @@ function formatTime(seconds) {
  * playing or buffering and it has to win, because a viewer who just moved the scrubber needs to see
  * that the receiver took it.
  */
+let lastRaw = { state: "?", isSeeking: false };
+
 function renderPlayerData(data) {
   if (!data) return;
+  lastRaw = { state: data.state, isSeeking: Boolean(data.isSeeking) };
 
   const state = resolveState(data);
   if (state === State.Logo) {
@@ -471,10 +474,9 @@ function dumpOverlayDiagnostics(reason) {
       ? JSON.stringify(controls.hasMediaControlsOverlay())
       : "?";
     log(`overlay diag ${reason}`, {
-      mcState: typeof context.getMediaControlsState === "function" ? context.getMediaControlsState() : "?",
-      overlayApi,
+      pstate: lastRaw.state,
+      seeking: lastRaw.isSeeking,
       shadowTvOverlay: overlay ? getComputedStyle(overlay).display : "absent",
-      styled: Boolean(root && root.getElementById("btv-shadow-styles")),
     });
   } catch (error) {
     logError("overlay diagnostics failed", error);
