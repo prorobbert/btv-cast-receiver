@@ -65,6 +65,12 @@ function showDebugPanel() {
   debugPanel.id = 'btv-debug';
   debugPanel.textContent = debugLines.join('\n');
   document.body.appendChild(debugPanel);
+  /*
+   * The ticker belongs to the panel, not to how it was raised: a LOAD carrying customData.debug is
+   * the normal way in from the app — ?debug=1 needs a url the sender cannot set — and it used to get
+   * the panel without the periodic probe, which is the line that says what state CAF settles in.
+   */
+  setInterval(() => probeState('tick'), 3000);
 }
 
 function log(message) {
@@ -629,10 +635,7 @@ function probeState(where) {
     /* diagnostic only */
   }
 }
-if (debugRequested) {
-  showDebugPanel();
-  setInterval(() => probeState('tick'), 3000);
-}
+if (debugRequested) showDebugPanel();
 
 /*
  * Did CAF actually act on the element? Under skipPlayersLoad it has no player of its own left, and
