@@ -12,9 +12,15 @@
  *   mediaElement    — the SDK watches our <video>, so volume, mute, its idle detection and the
  *                     MediaStatus it broadcasts keep tracking real playback without us pushing them.
  *
+ * Transport is deliberately *not* ours. With mediaElement set, CAF acts on the element itself for
+ * PLAY / PAUSE / SEEK, and only then do its internal flags — the paused-intent and buffering flags
+ * MediaStatus.playerState is derived from — stay in step with what the element is doing. Driving the
+ * element directly behind CAF's back is what made a sender read PAUSED over a playing stream. Every
+ * transport interceptor below therefore shapes the request and hands it back; it never acts.
+ *
  * What we now own, and therefore have to do by hand:
  *   - loading manifests, including DRM licence servers, headers and robustness (Shaka);
- *   - acting on PLAY / PAUSE / SEEK / STOP, because no SDK player is left to act for us;
+ *   - starting playback after a LOAD, through CAF's own play() so its flags are set;
  *   - publishing duration, stream type and the track list, so senders have something to draw;
  *   - text and audio track selection, since EDIT_TRACKS_INFO now has to reach Shaka;
  *   - the whole UI. PlayerDataBinder went with the SDK player that fed it, so the overlay is driven
@@ -593,7 +599,13 @@ playerManager.setMessageInterceptor(messages.MessageType.LOAD, async loadRequest
   applyActiveTracks(loadRequestData.activeTrackIds);
 
   if (loadRequestData.autoplay !== false) {
-    video.play().catch(error => log(`play() rejected: ${error && error.message}`));
+    /*
+     * playerManager.play() rather than video.play(): both start the element, but only this one also
+     * clears CAF's paused-intent flag, which is half of what a sender reads as playerState. Started
+     * with video.play() the stream plays while every sender still shows it paused.
+     */
+    playerManager.play();
+    ensureElement(false, 'LOAD autoplay');
   } else {
     starting = false;
   }
@@ -622,17 +634,40 @@ if (debugRequested) {
   setInterval(() => probeState('tick'), 3000);
 }
 
+/*
+ * Did CAF actually act on the element? Under skipPlayersLoad it has no player of its own left, and
+ * whether its transport still reaches the mediaElement is the assumption this whole file now rests
+ * on. Rather than assume, check shortly after: if the element did not follow, say so loudly and move
+ * it, so a receiver that lands on a CAF version which stopped doing this degrades to a working
+ * player with a lying sender instead of a dead one.
+ */
+function ensureElement(expectPaused, where) {
+  setTimeout(() => {
+    if (video.paused === expectPaused) return;
+    log(`WARNING: CAF did not ${expectPaused ? 'pause' : 'play'} the element on ${where} — correcting`);
+    if (expectPaused) video.pause();
+    else video.play().catch(error => log(`play() rejected: ${error && error.message}`));
+    probeState(`fallback ${where}`);
+  }, 400);
+}
+
 /* --- transport: the messages the SDK used to act on itself ---------------------------------- */
 
+/*
+ * Nothing here touches the element. CAF applies the request to the mediaElement after the
+ * interceptor returns, and doing it ourselves as well is what desynchronised its flags from the
+ * element in the first place. [ensureElement] is a watchdog, not a second transport: it logs — and
+ * only as a last resort corrects — the case where CAF did not act at all.
+ */
 playerManager.setMessageInterceptor(messages.MessageType.PLAY, request => {
-  video.play().catch(error => log(`play() rejected: ${error && error.message}`));
   probeState('after PLAY');
+  ensureElement(false, 'PLAY');
   return request;
 });
 
 playerManager.setMessageInterceptor(messages.MessageType.PAUSE, request => {
-  video.pause();
   probeState('after PAUSE');
+  ensureElement(true, 'PAUSE');
   return request;
 });
 
@@ -640,7 +675,8 @@ playerManager.setMessageInterceptor(messages.MessageType.SEEK, request => {
   /*
    * Senders send either an absolute currentTime or, for live, a relativeTime against the live edge.
    * Both get clamped into the seekable window: seeking past the edge of a DVR window strands playback
-   * in a gap that only a reload recovers from.
+   * in a gap that only a reload recovers from. The clamped value is written back into the request so
+   * CAF seeks to it — the request is the only way to reach CAF's own seek handling.
    */
   const span = player ? player.seekRange() : null;
   let target = Number(request.currentTime);
@@ -651,8 +687,9 @@ playerManager.setMessageInterceptor(messages.MessageType.SEEK, request => {
   if (span && Number.isFinite(span.start) && Number.isFinite(span.end)) {
     target = Math.min(Math.max(target, span.start), span.end);
   }
+  request.currentTime = target;
+  delete request.relativeTime;
   log(`SEEK → ${target.toFixed(1)}s`);
-  video.currentTime = target;
   return request;
 });
 
@@ -668,12 +705,6 @@ playerManager.setMessageInterceptor(messages.MessageType.STOP, request => {
 playerManager.setMessageInterceptor(messages.MessageType.EDIT_TRACKS_INFO, request => {
   applyActiveTracks(request.activeTrackIds, request.enableTextTracks);
   if (request.language && player) player.selectAudioLanguage(request.language);
-  return request;
-});
-
-playerManager.setMessageInterceptor(messages.MessageType.SET_PLAYBACK_RATE, request => {
-  const rate = Number(request.playbackRate);
-  if (Number.isFinite(rate) && rate > 0) video.playbackRate = rate;
   return request;
 });
 
