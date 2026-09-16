@@ -12,15 +12,18 @@
  *   mediaElement    — the SDK watches our <video>, so volume, mute, its idle detection and the
  *                     MediaStatus it broadcasts keep tracking real playback without us pushing them.
  *
- * Transport is deliberately *not* ours. With mediaElement set, CAF acts on the element itself for
- * PLAY / PAUSE / SEEK, and only then do its internal flags — the paused-intent and buffering flags
- * MediaStatus.playerState is derived from — stay in step with what the element is doing. Driving the
- * element directly behind CAF's back is what made a sender read PAUSED over a playing stream. Every
- * transport interceptor below therefore shapes the request and hands it back; it never acts.
+ * Measured on a Google TV Streamer (2026-09-16): under skipPlayersLoad the SDK neither drives the
+ * mediaElement nor listens to it. playerManager.play() leaves the element paused, and after a LOAD
+ * its internal buffering flag is raised and never cleared, because the player whose events would
+ * clear it does not exist. getPlayerState() then reports BUFFERING over a stream that is playing at
+ * readyState 4 — and a media3 sender reads that as "not playing", which is the phone showing a play
+ * button that does nothing. So transport is ours, and the MEDIA_STATUS interceptor below replaces
+ * CAF's derived playerState with what the element is actually doing before the status goes out.
  *
  * What we now own, and therefore have to do by hand:
  *   - loading manifests, including DRM licence servers, headers and robustness (Shaka);
- *   - starting playback after a LOAD, through CAF's own play() so its flags are set;
+ *   - acting on PLAY / PAUSE / SEEK / STOP, because no SDK player is left to act for us;
+ *   - the playerState every sender reads, for the same reason;
  *   - publishing duration, stream type and the track list, so senders have something to draw;
  *   - text and audio track selection, since EDIT_TRACKS_INFO now has to reach Shaka;
  *   - the whole UI. PlayerDataBinder went with the SDK player that fed it, so the overlay is driven
@@ -605,13 +608,7 @@ playerManager.setMessageInterceptor(messages.MessageType.LOAD, async loadRequest
   applyActiveTracks(loadRequestData.activeTrackIds);
 
   if (loadRequestData.autoplay !== false) {
-    /*
-     * playerManager.play() rather than video.play(): both start the element, but only this one also
-     * clears CAF's paused-intent flag, which is half of what a sender reads as playerState. Started
-     * with video.play() the stream plays while every sender still shows it paused.
-     */
-    playerManager.play();
-    ensureElement(false, 'LOAD autoplay');
+    video.play().catch(error => log(`play() rejected: ${error && error.message}`));
   } else {
     starting = false;
   }
@@ -637,40 +634,17 @@ function probeState(where) {
 }
 if (debugRequested) showDebugPanel();
 
-/*
- * Did CAF actually act on the element? Under skipPlayersLoad it has no player of its own left, and
- * whether its transport still reaches the mediaElement is the assumption this whole file now rests
- * on. Rather than assume, check shortly after: if the element did not follow, say so loudly and move
- * it, so a receiver that lands on a CAF version which stopped doing this degrades to a working
- * player with a lying sender instead of a dead one.
- */
-function ensureElement(expectPaused, where) {
-  setTimeout(() => {
-    if (video.paused === expectPaused) return;
-    log(`WARNING: CAF did not ${expectPaused ? 'pause' : 'play'} the element on ${where} — correcting`);
-    if (expectPaused) video.pause();
-    else video.play().catch(error => log(`play() rejected: ${error && error.message}`));
-    probeState(`fallback ${where}`);
-  }, 400);
-}
-
 /* --- transport: the messages the SDK used to act on itself ---------------------------------- */
 
-/*
- * Nothing here touches the element. CAF applies the request to the mediaElement after the
- * interceptor returns, and doing it ourselves as well is what desynchronised its flags from the
- * element in the first place. [ensureElement] is a watchdog, not a second transport: it logs — and
- * only as a last resort corrects — the case where CAF did not act at all.
- */
 playerManager.setMessageInterceptor(messages.MessageType.PLAY, request => {
+  video.play().catch(error => log(`play() rejected: ${error && error.message}`));
   probeState('after PLAY');
-  ensureElement(false, 'PLAY');
   return request;
 });
 
 playerManager.setMessageInterceptor(messages.MessageType.PAUSE, request => {
+  video.pause();
   probeState('after PAUSE');
-  ensureElement(true, 'PAUSE');
   return request;
 });
 
@@ -690,9 +664,8 @@ playerManager.setMessageInterceptor(messages.MessageType.SEEK, request => {
   if (span && Number.isFinite(span.start) && Number.isFinite(span.end)) {
     target = Math.min(Math.max(target, span.start), span.end);
   }
-  request.currentTime = target;
-  delete request.relativeTime;
   log(`SEEK → ${target.toFixed(1)}s`);
+  video.currentTime = target;
   return request;
 });
 
@@ -705,10 +678,42 @@ playerManager.setMessageInterceptor(messages.MessageType.STOP, request => {
   return request;
 });
 
+playerManager.setMessageInterceptor(messages.MessageType.SET_PLAYBACK_RATE, request => {
+  const rate = Number(request.playbackRate);
+  if (Number.isFinite(rate) && rate > 0) video.playbackRate = rate;
+  return request;
+});
+
 playerManager.setMessageInterceptor(messages.MessageType.EDIT_TRACKS_INFO, request => {
   applyActiveTracks(request.activeTrackIds, request.enableTextTracks);
   if (request.language && player) player.selectAudioLanguage(request.language);
   return request;
+});
+
+/*
+ * The one that makes a sender believe us.
+ *
+ * CAF derives MediaStatus.playerState from flags its own player maintains — a paused-intent flag and
+ * a buffering flag. Under skipPlayersLoad that player does not exist, so the buffering flag raised by
+ * the LOAD is never lowered and every status says BUFFERING for as long as the session lasts. A
+ * media3 sender turns that into STATE_BUFFERING with nothing playing: the play button on the phone
+ * does nothing, because as far as it knows it already asked.
+ *
+ * MEDIA_STATUS is the outgoing status message, and it is interceptable, so the state we already
+ * compute for our own overlay is written over CAF's guess on the way out. Only playerState — the
+ * rest of the status (volume, mute, media, seekable range) is either right already or the sender's
+ * only source for it.
+ */
+playerManager.setMessageInterceptor(messages.MessageType.MEDIA_STATUS, status => {
+  if (!status) return status;
+  /* Nothing loaded is CAF's own business: its IDLE, with its idle reason, is the honest answer. */
+  if (!player || !player.getAssetUri()) return status;
+
+  if (video.paused) status.playerState = messages.PlayerState.PAUSED;
+  else if (starting || shakaBuffering || video.readyState < 3) status.playerState = messages.PlayerState.BUFFERING;
+  else status.playerState = messages.PlayerState.PLAYING;
+
+  return status;
 });
 
 /* --- events, options, start ----------------------------------------------------------------- */
