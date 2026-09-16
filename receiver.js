@@ -45,6 +45,22 @@ castDebugLogger.loggerLevelByEvents = {
 };
 castDebugLogger.loggerLevelByTags = { [LOG_TAG]: cast.framework.LoggerLevel.DEBUG };
 
+/*
+ * A debug panel we render ourselves. The SDK's CastDebugLogger overlay never painted on the Google TV
+ * Streamer and its BTV tag never reached the CaC tool, so this plain <pre> in our own DOM is the only
+ * reliable on-TV log. Gated behind ?debug=1 / customData.debug; never on by default.
+ */
+const debugLines = [];
+let debugPanel = null;
+
+function showDebugPanel() {
+  if (debugPanel) return;
+  debugPanel = document.createElement('pre');
+  debugPanel.id = 'btv-debug';
+  debugPanel.textContent = debugLines.join('\n');
+  document.body.appendChild(debugPanel);
+}
+
 function log(message) {
   try {
     console.log(`[btv] ${message}`);
@@ -52,9 +68,17 @@ function log(message) {
   } catch (error) {
     /* logging must never break playback */
   }
+  try {
+    debugLines.push(message);
+    if (debugLines.length > 30) debugLines.shift();
+    if (debugPanel) debugPanel.textContent = debugLines.join('\n');
+  } catch (error) {
+    /* diagnostic only */
+  }
 }
 
 function showDebugOverlay() {
+  showDebugPanel();
   try {
     castDebugLogger.setEnabled(true);
     castDebugLogger.showDebugLogs(true);
@@ -593,7 +617,10 @@ function probeState(where) {
     /* diagnostic only */
   }
 }
-if (debugRequested) setInterval(() => probeState('tick'), 3000);
+if (debugRequested) {
+  showDebugPanel();
+  setInterval(() => probeState('tick'), 3000);
+}
 
 /* --- transport: the messages the SDK used to act on itself ---------------------------------- */
 
