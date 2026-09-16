@@ -31,21 +31,39 @@ body {
 }
 
 /*
- * The picture. Everything inside the element lives in a shadow root, so these rules only place the
- * element itself — receiver.js styles its contents from the inside (styleCastPlayer).
+ * The picture. The element is ours now — no shadow root, no SDK chrome to hide — so it is simply a
+ * full-bleed video with the surface colour behind it for the letterbox bars.
  */
-cast-media-player {
+#stage {
   position: fixed;
   inset: 0;
+  background: var(--btv-black);
+}
+
+#stage video {
   width: 100%;
   height: 100%;
+  object-fit: contain;
   background: var(--btv-black);
+}
+
+/*
+ * Shaka draws text cues in here. It sits above the picture and below the HUD, and stops short of the
+ * bottom so a subtitle never lands on the seek bar when the chrome is up.
+ */
+#captions {
+  position: absolute;
+  inset: 0 0 18.5% 0; /* 100/540, just clear of the HUD's top edge */
+  z-index: 1;
+  pointer-events: none;
+  font-size: 2.5vw; /* 24/960, the design's body-large size */
+  line-height: 1.35;
 }
 
 #overlay {
   position: fixed;
   inset: 0;
-  z-index: 1; /* above the picture */
+  z-index: 2; /* above the picture and the caption layer */
   pointer-events: none; /* the receiver is never touched; input arrives as media messages */
 }
 
@@ -69,6 +87,18 @@ body[data-state="logo"] .logoScreen {
 .logoScreen img {
   width: 20.8%; /* 200/960, the size the logo has on the design board */
   height: auto;
+}
+
+/* Only ever filled in when a load failed; the logo screen is the only place with room to say so. */
+.logoScreen__error {
+  margin: 0;
+  font-size: 1.667vw; /* 16/960 */
+  line-height: 1.5;
+  color: var(--btv-help);
+}
+
+.logoScreen__error:empty {
+  display: none;
 }
 
 /* Deliberately faint: a developer aid, not part of the design. Disappears on an unstamped build. */

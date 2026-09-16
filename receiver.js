@@ -3,25 +3,34 @@
 /*
  * Budget Thuis TV — Cast receiver.
  *
- * <cast-media-player> stays the engine: it loads and plays the media, answers PLAY/PAUSE/SEEK from the
- * remote and from senders, and broadcasts MediaStatus back to those senders — all automatically, the
- * same machinery Google's own receivers use. This file adds two things on top:
+ * There is no <cast-media-player> here. The page owns a plain <video> and a Shaka Player instance,
+ * and the CAF SDK is kept purely as the cast protocol layer: it accepts sender connections, hands us
+ * LOAD / PLAY / PAUSE / SEEK / STOP / EDIT_TRACKS_INFO as interceptable messages, and broadcasts
+ * MediaStatus back to phones, Google Home and the remote. Two options make the split explicit:
  *
- *   1. A LOAD interceptor for our DRM and live-edge handling.
- *   2. A custom skin. The player's built-in chrome is hidden inside its (open) shadow root, and a
- *      PlayerDataBinder drives our own DOM overlay — the STB player design. The engine still owns
- *      playback and sender messaging; we only draw.
+ *   skipPlayersLoad — the SDK does not fetch MPL or a Shaka build of its own; ours is the only one.
+ *   mediaElement    — the SDK watches our <video>, so volume, mute, its idle detection and the
+ *                     MediaStatus it broadcasts keep tracking real playback without us pushing them.
  *
- * On a TV the receiver takes no touch input: the remote drives PlayerManager directly, so our overlay
- * is display-only. "User pauses on the receiver" means the remote's pause reaches PlayerManager, which
- * pauses and notifies senders itself — nothing for us to send by hand.
+ * What we now own, and therefore have to do by hand:
+ *   - loading manifests, including DRM licence servers, headers and robustness (Shaka);
+ *   - acting on PLAY / PAUSE / SEEK / STOP, because no SDK player is left to act for us;
+ *   - publishing duration, stream type and the track list, so senders have something to draw;
+ *   - text and audio track selection, since EDIT_TRACKS_INFO now has to reach Shaka;
+ *   - the whole UI. PlayerDataBinder went with the SDK player that fed it, so the overlay is driven
+ *     straight off the media element and Shaka.
+ *
+ * On a TV the receiver takes no touch input: the remote's keys arrive as media messages, so the
+ * overlay stays display-only.
  */
 
 const context = cast.framework.CastReceiverContext.getInstance();
 const playerManager = context.getPlayerManager();
-const { messages, events, system, ui } = cast.framework;
+const { messages, events, system } = cast.framework;
 
 const body = document.body;
+const video = document.getElementById('video');
+const captions = document.getElementById('captions');
 const build = window.BTV_BUILD || {};
 
 /* --- debug logger --------------------------------------------------------------------------- */
@@ -54,40 +63,7 @@ function showDebugOverlay() {
   }
 }
 
-/* --- hide the player's built-in chrome ------------------------------------------------------ */
-
-/*
- * <cast-media-player> opens its shadow root (attachShadow({mode:"open"})), so a stylesheet appended
- * to it can hide the SDK's launch/idle chrome and leave only the <video>. Our overlay is drawn on top
- * in the light DOM. The platform's own system pause overlay is drawn by the OS above the WebView and
- * is not reachable from here — that is a Google TV behaviour, the same one every casting app gets.
- */
-const SHADOW_STYLES = `
-  .background, .logo, .spinner, .splash, .slideshow, tv-overlay-placeholder, tv-overlay {
-    display: none !important;
-  }
-  #castPlayer, .foreground { background: #0e0e0e !important; }
-  .mediaElement { object-fit: contain !important; }
-`;
-
-function styleCastPlayer() {
-  const player = document.querySelector('cast-media-player');
-  const root = player && player.shadowRoot;
-  if (!root) return false;
-  if (root.getElementById('btv-shadow-styles')) return true;
-  const style = document.createElement('style');
-  style.id = 'btv-shadow-styles';
-  style.textContent = SHADOW_STYLES;
-  root.appendChild(style);
-  return true;
-}
-
-function styleCastPlayerWhenReady(attemptsLeft = 40) {
-  if (styleCastPlayer() || attemptsLeft <= 0) return;
-  setTimeout(() => styleCastPlayerWhenReady(attemptsLeft - 1), 50);
-}
-
-/* --- the custom UI -------------------------------------------------------------------------- */
+/* --- UI state ------------------------------------------------------------------------------- */
 
 const State = {
   Logo: 'logo',
@@ -107,6 +83,7 @@ const el = {
   buffer: document.getElementById('buffer'),
   handle: document.getElementById('handle'),
   buildLine: document.getElementById('build'),
+  errorLine: document.getElementById('error'),
 };
 
 if (el.buildLine && build.stamped) el.buildLine.textContent = `${build.stamped} · ${build.commit}`;
@@ -147,128 +124,511 @@ function setState(state) {
   if (state === State.Playing) armChromeFade();
 }
 
-let seekingTicks = 0;
-let bufferingSince = 0;
-
-function resolveState(data) {
-  seekingTicks = data.isSeeking ? seekingTicks + 1 : 0;
-  if (data.state !== 'BUFFERING') bufferingSince = 0;
-
-  // A live pause reports PAUSED with isSeeking flickering true; paused must win over the seek heuristic.
-  if (data.state === 'PAUSED') return State.Paused;
-  if (seekingTicks >= 2) return State.Seeking;
-  if (data.state === 'PLAYING') return State.Playing;
-  if (data.state === 'BUFFERING') {
-    // Live playback flaps PLAYING<->BUFFERING at the edge; a brief flap keeps the last visible state.
-    if (!bufferingSince) bufferingSince = Date.now();
-    const brief = Date.now() - bufferingSince < 1500;
-    const prev = body.dataset.state;
-    if (brief && (prev === State.Playing || prev === State.Paused)) return prev;
-    return State.Buffering;
-  }
-  // IDLE / LOADING / unknown: logo only when nothing is on its way, else hold the last state.
-  return body.dataset.state && body.dataset.state !== State.Logo ? body.dataset.state : State.Logo;
+function showError(text) {
+  if (el.errorLine) el.errorLine.textContent = text || '';
 }
 
-function renderProgress(data) {
-  const position = Number(data.currentTime);
+/* --- Shaka ---------------------------------------------------------------------------------- */
+
+/*
+ * One Shaka instance for the life of the receiver: creating it per load leaks MediaSource objects on
+ * these devices, and load() already tears down whatever came before.
+ */
+let player = null;
+let shakaBuffering = false;
+
+/*
+ * Applied at startup and again after every resetConfiguration() — which wipes it, so re-applying it
+ * per load is not belt and braces, it is the only thing keeping cues on screen after the second item.
+ *
+ * Cues go into our own container instead of the element's native track list, so the design's type
+ * applies and the platform's caption settings cannot override it.
+ */
+function baseConfiguration() {
+  return {
+    textDisplayFactory: () => new shaka.text.UITextDisplayer(video, captions),
+  };
+}
+
+const shakaReady = (async () => {
+  if (!window.shaka || !shaka.Player || !shaka.Player.isBrowserSupported()) {
+    log('shaka missing or unsupported on this device');
+    showError('Player kon niet starten');
+    return null;
+  }
+  shaka.polyfill.installAll();
+  const instance = new shaka.Player();
+  instance.configure(baseConfiguration());
+
+  instance.addEventListener('error', event => {
+    const detail = event && event.detail;
+    log(`shaka error ${detail && detail.code} ${detail && detail.data}`);
+  });
 
   /*
-   * The bar measures the broadcast, per the design: prefer the section the sender attaches
-   * (sectionStartTimeInMedia + sectionDuration), then the live seekable range, then item duration.
+   * Shaka's own buffering signal is more honest than the element's `waiting`, which on live edges
+   * fires for a single frame and would otherwise flash the spinner.
    */
-  const sectionStart = Number(data.sectionStartTimeInMedia);
-  const sectionDuration = Number(data.sectionDuration);
-  const range = data.liveSeekableRange;
+  instance.addEventListener('buffering', event => {
+    shakaBuffering = Boolean(event && event.buffering);
+    renderState();
+  });
 
-  let start = 0;
-  let end = Number(data.duration);
-  if (data.isLive && Number.isFinite(sectionStart) && sectionDuration > 0) {
-    start = sectionStart;
-    end = sectionStart + sectionDuration;
-  } else if (data.isLive && range && Number.isFinite(range.start) && Number.isFinite(range.end)) {
-    start = Number(range.start);
-    end = Number(range.end);
+  await instance.attach(video);
+  log(`shaka ${shaka.Player.version} attached`);
+  return instance;
+})();
+
+const KEY_SYSTEMS = {
+  widevine: 'com.widevine.alpha',
+  playready: 'com.microsoft.playready',
+  fairplay: 'com.apple.fps',
+  clearkey: 'org.w3.clearkey',
+};
+
+/*
+ * DRM comes off the load request, in the shape the senders already send:
+ *
+ *   media.customData.drm = {
+ *     protectionSystem: "widevine" | "playready" | "fairplay" | "clearkey",   // default widevine
+ *     licenseUrl: "https://…",
+ *     headers: { "X-AxDRM-Message": "…" },      // sent on licence requests only
+ *     servers: { "com.widevine.alpha": "…" },   // optional, for multi-key-system manifests
+ *     videoRobustness: "HW_SECURE_ALL",         // optional; empty means "let EME negotiate"
+ *     audioRobustness: "HW_SECURE_CRYPTO",
+ *     persistentState: false,
+ *     withCredentials: false
+ *   }
+ *
+ * Chromecast hardware is Widevine, and Widevine L1 on anything current; PlayReady is only there on
+ * Android TV boxes that ship it. Naming a robustness level is worth doing when the licence server
+ * refuses L3 — without it EME may negotiate a session the server then rejects, which surfaces as a
+ * licence error rather than as a capability error and is miserable to diagnose.
+ */
+function drmConfiguration(drm) {
+  const servers = {};
+  const advanced = {};
+  if (drm) {
+    if (drm.servers && typeof drm.servers === 'object') Object.assign(servers, drm.servers);
+    if (drm.licenseUrl) {
+      const named = String(drm.protectionSystem || drm.keySystem || 'widevine').toLowerCase();
+      servers[KEY_SYSTEMS[named] || drm.keySystem || KEY_SYSTEMS.widevine] = drm.licenseUrl;
+    }
+    Object.keys(servers).forEach(keySystem => {
+      advanced[keySystem] = {
+        videoRobustness: drm.videoRobustness || '',
+        audioRobustness: drm.audioRobustness || '',
+        persistentStateRequired: Boolean(drm.persistentState),
+      };
+    });
   }
-  const span = end - start;
-  const clamp = v => Math.min(1, Math.max(0, v));
-  const fraction = Number.isFinite(span) && span > 0 ? clamp((position - start) / span) : 0;
-  const percent = `${fraction * 100}%`;
-
-  el.position.textContent = formatTime(position - start);
-  el.duration.textContent = Number.isFinite(span) && span > 0 ? formatTime(span) : '--:--';
-  el.progress.style.width = percent;
-  el.handle.style.left = percent;
-  el.buffer.style.width = percent;
+  return { drm: { servers, advanced } };
 }
 
-function renderPlayerData(data) {
-  if (!data) return;
-  try {
-    const state = resolveState(data);
-    if (state === State.Logo) {
-      setState(State.Logo);
+/*
+ * Headers are per-request-type on purpose. A licence token does not belong on segment requests (it
+ * would be logged by every CDN edge on the path), and a CDN token does not belong on licence
+ * requests. media.customData.headers covers manifest and segments; drm.headers covers licences.
+ */
+function installNetworkFilters(custom) {
+  const engine = player && player.getNetworkingEngine();
+  if (!engine) return;
+  engine.clearAllRequestFilters();
+
+  const drm = custom.drm || {};
+  const licenceHeaders = drm.headers || {};
+  const contentHeaders = custom.headers || {};
+  const RequestType = shaka.net.NetworkingEngine.RequestType;
+
+  engine.registerRequestFilter((type, request) => {
+    if (type === RequestType.LICENSE) {
+      Object.assign(request.headers, licenceHeaders);
+      if (drm.withCredentials) request.allowCrossSiteCredentials = true;
       return;
     }
-    body.dataset.live = String(Boolean(data.isLive));
-    el.title.textContent = data.title || '';
-    el.subtitle.textContent = data.subtitle || '';
-    const artwork = data.thumbnailUrl || '';
-    body.dataset.hasArtwork = String(Boolean(artwork));
-    if (artwork && el.artwork.getAttribute('src') !== artwork) el.artwork.setAttribute('src', artwork);
-    renderProgress(data);
-    setState(state);
-  } catch (error) {
-    log(`render failed: ${error && error.message ? error.message : error}`);
-  }
+    if (type === RequestType.MANIFEST || type === RequestType.SEGMENT) {
+      Object.assign(request.headers, contentHeaders);
+      if (custom.withCredentials) request.allowCrossSiteCredentials = true;
+    }
+  });
 }
 
-const binder = new ui.PlayerDataBinder(new ui.PlayerData());
-binder.addEventListener(ui.PlayerDataEventType.ANY_CHANGE, () => renderPlayerData(binder.getPlayerData()));
+/* --- tracks --------------------------------------------------------------------------------- */
 
-/* --- LOAD interceptor: DRM + live edge ------------------------------------------------------ */
+/*
+ * Senders can only offer a track picker for tracks they have been told about, and EDIT_TRACKS_INFO
+ * comes back as a list of the ids we published — so the ids here are Shaka's own, unmodified, and
+ * the mapping back is a straight lookup.
+ */
+const AUDIO_TRACK_ID_BASE = 100000;
+const audioTrackIds = new Map();
 
-function applyDrm(loadRequestData) {
-  const custom = loadRequestData.media.customData || {};
-  const drm = custom.drm || (loadRequestData.customData && loadRequestData.customData.drm);
-  if (!drm || !drm.licenseUrl) {
-    log('no DRM in customData — clear stream');
+function describeTracks() {
+  if (!player) return [];
+  const tracks = [];
+
+  player.getTextTracks().forEach(track => {
+    const description = new messages.Track(track.id, messages.TrackType.TEXT);
+    description.trackContentType = track.mimeType || 'text/vtt';
+    description.language = track.language && track.language !== 'und' ? track.language : undefined;
+    description.name = track.label || track.language || 'Ondertiteling';
+    description.subtype =
+      track.kind === 'caption' ? messages.TextTrackType.CAPTIONS : messages.TextTrackType.SUBTITLES;
+    if (track.roles && track.roles.length) description.roles = track.roles;
+    tracks.push(description);
+  });
+
+  /*
+   * Audio is offered per language rather than per variant: a sender showing "Nederlands" twice
+   * because the manifest carries two bitrates of it is a bug report waiting to happen. The id is
+   * synthesised above Shaka's range, and audioTrackIds maps it back to a language.
+   */
+  audioTrackIds.clear();
+  const languages = player.getAudioLanguagesAndRoles();
+  if (languages.length > 1) {
+    languages.forEach((entry, index) => {
+      const id = AUDIO_TRACK_ID_BASE + index;
+      audioTrackIds.set(id, entry);
+      const description = new messages.Track(id, messages.TrackType.AUDIO);
+      description.language = entry.language;
+      description.name = entry.label || entry.language;
+      if (entry.role) description.roles = [entry.role];
+      tracks.push(description);
+    });
+  }
+
+  return tracks;
+}
+
+function applyActiveTracks(activeTrackIds, enableTextTracks) {
+  if (!player) return;
+  const ids = Array.isArray(activeTrackIds) ? activeTrackIds : [];
+
+  const audio = ids.map(id => audioTrackIds.get(id)).find(Boolean);
+  if (audio) player.selectAudioLanguage(audio.language, audio.role || undefined);
+
+  const text = player.getTextTracks().find(track => ids.indexOf(track.id) !== -1);
+  if (text) {
+    player.selectTextTrack(text);
+    player.setTextTrackVisibility(true);
+  } else if (enableTextTracks !== true) {
+    player.setTextTrackVisibility(false);
+  }
+  log(`tracks: ${ids.join(',') || 'none'} active`);
+}
+
+/* --- what is on screen ---------------------------------------------------------------------- */
+
+/*
+ * Everything the overlay needs that the media element cannot tell us: the metadata off the load
+ * request, and the window the seek bar measures.
+ */
+let current = {
+  title: '',
+  subtitle: '',
+  artwork: '',
+  live: false,
+  sectionStart: NaN,
+  sectionDuration: NaN,
+};
+
+function timeline() {
+  /*
+   * The bar measures the broadcast, per the design. Preference order: the section the sender attaches
+   * (customData.section), then Shaka's seekable range — which for a live DASH stream is the DVR
+   * window and for VOD is simply 0..duration.
+   */
+  if (Number.isFinite(current.sectionStart) && current.sectionDuration > 0) {
+    return { start: current.sectionStart, end: current.sectionStart + current.sectionDuration };
+  }
+  if (player) {
+    const range = player.seekRange();
+    if (range && Number.isFinite(range.start) && Number.isFinite(range.end) && range.end > range.start) {
+      return { start: range.start, end: range.end };
+    }
+  }
+  const duration = Number(video.duration);
+  return Number.isFinite(duration) && duration > 0 ? { start: 0, end: duration } : null;
+}
+
+function renderProgress() {
+  const span = timeline();
+  const position = Number(video.currentTime);
+  const clamp = v => Math.min(1, Math.max(0, v));
+
+  if (!span) {
+    el.position.textContent = formatTime(position);
+    el.duration.textContent = '--:--';
     return;
   }
-  const playbackConfig = new cast.framework.PlaybackConfig();
-  playbackConfig.licenseUrl = drm.licenseUrl;
-  playbackConfig.licenseRequestHandler = requestInfo => {
-    requestInfo.headers = requestInfo.headers || {};
-    Object.entries(drm.headers || {}).forEach(([key, value]) => {
-      requestInfo.headers[key] = value;
-    });
+
+  const length = span.end - span.start;
+  const fraction = length > 0 ? clamp((position - span.start) / length) : 0;
+  const percent = `${fraction * 100}%`;
+
+  /* Real buffered-ahead now that we hold the element: the design draws it behind the progress fill. */
+  let buffered = fraction;
+  for (let i = 0; i < video.buffered.length; i += 1) {
+    if (position >= video.buffered.start(i) && position <= video.buffered.end(i)) {
+      buffered = length > 0 ? clamp((video.buffered.end(i) - span.start) / length) : fraction;
+      break;
+    }
+  }
+
+  el.position.textContent = formatTime(position - span.start);
+  el.duration.textContent = formatTime(length);
+  el.progress.style.width = percent;
+  el.handle.style.left = percent;
+  el.buffer.style.width = `${buffered * 100}%`;
+}
+
+function renderMetadata() {
+  el.title.textContent = current.title;
+  el.subtitle.textContent = current.subtitle;
+  body.dataset.live = String(Boolean(current.live));
+  body.dataset.hasArtwork = String(Boolean(current.artwork));
+  if (current.artwork && el.artwork.getAttribute('src') !== current.artwork) {
+    el.artwork.setAttribute('src', current.artwork);
+  }
+}
+
+let seeking = false;
+
+/*
+ * Between the manifest being parsed and the first frame arriving the element is still `paused`, so
+ * without this the pause glyph flashes on screen at the start of every item. It is cleared by the
+ * first `playing`, or immediately when the load asked us not to autoplay.
+ */
+let starting = false;
+
+function renderState() {
+  if (!player || !player.getAssetUri()) {
+    setState(State.Logo);
+    return;
+  }
+  if (seeking) setState(State.Seeking);
+  else if (starting) setState(State.Buffering);
+  else if (video.paused) setState(State.Paused);
+  else if (shakaBuffering || video.readyState < 3) setState(State.Buffering);
+  else setState(State.Playing);
+}
+
+function render() {
+  renderState();
+  renderProgress();
+}
+
+['timeupdate', 'progress', 'durationchange'].forEach(type => video.addEventListener(type, renderProgress));
+['play', 'pause', 'waiting', 'ended', 'loadedmetadata', 'emptied'].forEach(type =>
+  video.addEventListener(type, render)
+);
+/* `playing` is handled apart from the list above because the flag has to be down before we draw. */
+video.addEventListener('playing', () => {
+  starting = false;
+  render();
+});
+video.addEventListener('seeking', () => {
+  seeking = true;
+  render();
+});
+video.addEventListener('seeked', () => {
+  seeking = false;
+  render();
+});
+
+/*
+ * The SDK broadcasts MediaStatus on a timer and on its own view of the element, but a sender that
+ * pressed pause wants the confirmation now, not in a second. These are the moments worth a push.
+ */
+['play', 'pause', 'seeked', 'ended', 'ratechange', 'volumechange', 'loadedmetadata'].forEach(type =>
+  video.addEventListener(type, () => {
+    try {
+      playerManager.broadcastStatus(true);
+    } catch (error) {
+      /* a status push must never break playback */
+    }
+  })
+);
+
+/*
+ * Safety net, not a fix. With skipPlayersLoad the SDK has no player to hand a LOAD to and in practice
+ * it leaves the element alone — but "in practice" is not a contract. If anything ever assigned
+ * media.contentUrl to video.src it would tear down Shaka's MediaSource and the screen would go black
+ * with no obvious cause. `emptied` is exactly that moment. We only shout: reassigning the source here
+ * would re-run the resource selection algorithm and make the mess worse.
+ */
+video.addEventListener('emptied', () => {
+  if (player && player.getAssetUri()) log('WARNING: media element emptied while an asset was loaded');
+});
+
+/* --- LOAD ----------------------------------------------------------------------------------- */
+
+function loadError(reason) {
+  const error = new messages.ErrorData(messages.ErrorType.LOAD_FAILED);
+  error.reason = reason;
+  return error;
+}
+
+function metadataOf(media) {
+  const metadata = media.metadata || {};
+  const images = metadata.images || [];
+  return {
+    title: metadata.title || metadata.seriesTitle || '',
+    subtitle: metadata.subtitle || metadata.artist || metadata.studio || '',
+    artwork: (images[0] && images[0].url) || '',
   };
-  playerManager.setPlaybackConfig(playbackConfig);
-  log('DRM configured');
 }
 
-function resolveLiveStartPosition(loadRequestData) {
-  if (loadRequestData.media.streamType !== messages.StreamType.LIVE) return;
-  const requestedLiveEdge = loadRequestData.media.customData &&
-    loadRequestData.media.customData.startAtLiveEdge === true;
-  const carriesPosition = Number.isFinite(loadRequestData.currentTime) && loadRequestData.currentTime > 0;
-  if (requestedLiveEdge || !carriesPosition) {
-    log('live item, no chosen position — starting at the live edge');
-    delete loadRequestData.currentTime;
-  }
-}
+/* A newer LOAD must always win; an older one that finishes late has to leave the screen alone. */
+let loadToken = 0;
 
-playerManager.setMessageInterceptor(messages.MessageType.LOAD, loadRequestData => {
-  if (!loadRequestData || !loadRequestData.media) {
-    const error = new messages.ErrorData(messages.ErrorType.LOAD_FAILED);
-    error.reason = messages.ErrorReason.INVALID_REQUEST;
-    return error;
+playerManager.setMessageInterceptor(messages.MessageType.LOAD, async loadRequestData => {
+  if (!loadRequestData || !loadRequestData.media) return loadError(messages.ErrorReason.INVALID_REQUEST);
+
+  const media = loadRequestData.media;
+  const url = media.contentUrl || media.contentId;
+  const custom = media.customData || loadRequestData.customData || {};
+  if (custom.debug === true || debugRequested) showDebugOverlay();
+  if (!url) return loadError(messages.ErrorReason.INVALID_REQUEST);
+
+  log(`LOAD ${url} (${media.streamType})`);
+  showError('');
+  starting = true;
+  render();
+
+  player = await shakaReady;
+  if (!player) return loadError(messages.ErrorReason.GENERIC_LOAD_ERROR);
+
+  const token = (loadToken += 1);
+
+  player.resetConfiguration();
+  player.configure(baseConfiguration());
+  player.configure(drmConfiguration(custom.drm));
+  if (custom.shaka && typeof custom.shaka === 'object') player.configure(custom.shaka);
+  installNetworkFilters(custom);
+  log(custom.drm && custom.drm.licenseUrl ? 'DRM configured' : 'no DRM in customData — clear stream');
+
+  /*
+   * A live item with no position the user chose starts at the live edge; passing undefined lets Shaka
+   * pick it, which is more accurate than any number we could compute before the manifest is parsed.
+   */
+  const isLiveRequest = media.streamType === messages.StreamType.LIVE;
+  const chosePosition = Number.isFinite(loadRequestData.currentTime) && loadRequestData.currentTime > 0;
+  const startTime = isLiveRequest && (custom.startAtLiveEdge === true || !chosePosition)
+    ? undefined
+    : loadRequestData.currentTime;
+  if (startTime === undefined && isLiveRequest) log('live item, no chosen position — starting at the live edge');
+
+  try {
+    await player.load(url, startTime, media.contentType || undefined);
+  } catch (error) {
+    const code = error && error.code;
+    log(`shaka load failed: ${code} ${error && error.message}`);
+    showError('Deze uitzending kan nu niet worden afgespeeld');
+    starting = false;
+    setState(State.Logo);
+    return loadError(messages.ErrorReason.GENERIC_LOAD_ERROR);
   }
-  log(`LOAD ${loadRequestData.media.contentId} (${loadRequestData.media.streamType})`);
-  if (loadRequestData.media.customData && loadRequestData.media.customData.debug === true) showDebugOverlay();
-  applyDrm(loadRequestData);
-  resolveLiveStartPosition(loadRequestData);
+
+  if (token !== loadToken) {
+    log('a newer LOAD overtook this one — dropping it');
+    return loadRequestData;
+  }
+
+  /*
+   * Tell the senders what we ended up with. Without this they have a null duration and an empty track
+   * list, and the phone's scrubber has nothing to talk to — the SDK would normally fill these in from
+   * its own player, which no longer exists here.
+   */
+  const live = player.isLive();
+  const range = player.seekRange();
+  media.streamType = live ? messages.StreamType.LIVE : messages.StreamType.BUFFERED;
+  if (live) {
+    /* null is how a sender is told "this has no end"; a stale number from the request would be worse. */
+    media.duration = null;
+  } else {
+    const duration = Number.isFinite(video.duration) ? video.duration : range.end - range.start;
+    if (Number.isFinite(duration) && duration > 0) media.duration = duration;
+  }
+  media.tracks = describeTracks();
+
+  /*
+   * entity is the field that means "the app knows what this string is". Setting it keeps contentId
+   * from being read as a URL for the SDK to open behind our back.
+   */
+  if (!media.entity) media.entity = url;
+
+  const section = custom.section || {};
+  current = Object.assign(metadataOf(media), {
+    live,
+    sectionStart: Number(section.startTimeInMedia),
+    sectionDuration: Number(section.duration),
+  });
+  renderMetadata();
+
+  applyActiveTracks(loadRequestData.activeTrackIds);
+
+  if (loadRequestData.autoplay !== false) {
+    video.play().catch(error => log(`play() rejected: ${error && error.message}`));
+  } else {
+    starting = false;
+  }
+  render();
+  log(`loaded — ${live ? 'live' : 'vod'}, ${media.tracks.length} track(s)`);
   return loadRequestData;
+});
+
+/* --- transport: the messages the SDK used to act on itself ---------------------------------- */
+
+playerManager.setMessageInterceptor(messages.MessageType.PLAY, request => {
+  video.play().catch(error => log(`play() rejected: ${error && error.message}`));
+  return request;
+});
+
+playerManager.setMessageInterceptor(messages.MessageType.PAUSE, request => {
+  video.pause();
+  return request;
+});
+
+playerManager.setMessageInterceptor(messages.MessageType.SEEK, request => {
+  /*
+   * Senders send either an absolute currentTime or, for live, a relativeTime against the live edge.
+   * Both get clamped into the seekable window: seeking past the edge of a DVR window strands playback
+   * in a gap that only a reload recovers from.
+   */
+  const span = player ? player.seekRange() : null;
+  let target = Number(request.currentTime);
+  if (!Number.isFinite(target) && Number.isFinite(request.relativeTime) && span) {
+    target = span.end + Number(request.relativeTime);
+  }
+  if (!Number.isFinite(target)) return request;
+  if (span && Number.isFinite(span.start) && Number.isFinite(span.end)) {
+    target = Math.min(Math.max(target, span.start), span.end);
+  }
+  log(`SEEK → ${target.toFixed(1)}s`);
+  video.currentTime = target;
+  return request;
+});
+
+playerManager.setMessageInterceptor(messages.MessageType.STOP, request => {
+  starting = false;
+  if (player) player.unload().catch(() => {});
+  current = { title: '', subtitle: '', artwork: '', live: false, sectionStart: NaN, sectionDuration: NaN };
+  renderMetadata();
+  setState(State.Logo);
+  return request;
+});
+
+playerManager.setMessageInterceptor(messages.MessageType.EDIT_TRACKS_INFO, request => {
+  applyActiveTracks(request.activeTrackIds, request.enableTextTracks);
+  if (request.language && player) player.selectAudioLanguage(request.language);
+  return request;
+});
+
+playerManager.setMessageInterceptor(messages.MessageType.SET_PLAYBACK_RATE, request => {
+  const rate = Number(request.playbackRate);
+  if (Number.isFinite(rate) && rate > 0) video.playbackRate = rate;
+  return request;
 });
 
 /* --- events, options, start ----------------------------------------------------------------- */
@@ -279,12 +639,19 @@ playerManager.addEventListener(events.EventType.ERROR, event => {
 
 context.addEventListener(system.EventType.READY, () => {
   log(`receiver ready — build ${build.stamped || 'unstamped'} (${build.commit || '-'})`);
-  styleCastPlayer();
   if (debugRequested) showDebugOverlay();
   setState(State.Logo);
 });
 
 const castReceiverOptions = new cast.framework.CastReceiverOptions();
+
+/*
+ * The two options that make this a custom-player receiver rather than a skinned one. mediaElement is
+ * what keeps the SDK useful: volume, mute, its idle detection and the MediaStatus it broadcasts are
+ * all read off this element, so none of that has to be reimplemented here.
+ */
+castReceiverOptions.skipPlayersLoad = true;
+castReceiverOptions.mediaElement = video;
 
 /*
  * Our live streams have a DVR window, so pausing and seeking one is legitimate; without saying so the
@@ -297,5 +664,4 @@ castReceiverOptions.supportedCommands =
   messages.Command.STREAM_MUTE |
   messages.Command.EDIT_TRACKS;
 
-styleCastPlayerWhenReady();
 context.start(castReceiverOptions);

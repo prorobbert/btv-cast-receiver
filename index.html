@@ -5,12 +5,21 @@
     <title>Budget Thuis TV — Cast receiver</title>
 
     <!--
-      Both SDK scripts come from gstatic, never from this origin. Self-hosting them is what killed the
-      previous receiver: nginx served the copies as text/plain, Chromium refused to execute them with
-      nosniff set, `cast` stayed undefined and every session died on the ~60s CastInitTimeout watchdog.
+      The CAF SDK comes from gstatic, never from this origin. Self-hosting it is what killed an earlier
+      receiver: nginx served the copy as text/plain, Chromium refused to execute it with nosniff set,
+      `cast` stayed undefined and every session died on the ~60s CastInitTimeout watchdog.
     -->
     <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
     <script src="https://www.gstatic.com/cast/sdk/libs/devtools/debug_layer/caf_receiver_logger.js"></script>
+
+    <!--
+      Our playback engine. The SDK would normally fetch a Shaka build of its own; castReceiverOptions
+      .skipPlayersLoad stops that and this is the one it never sees. The version is pinned to the 4.15
+      line on purpose: that is the line Google itself ships inside CAF (4.15.56 is the SDK default and
+      it accepts >=4.15.56 <5.0.0), so it is the line actually exercised on Cast hardware. Moving to 5.x
+      is a deliberate decision, not a floating range — hence no ^ or ~ in the URL.
+    -->
+    <script src="https://cdn.jsdelivr.net/npm/shaka-player@4.15.60/dist/shaka-player.compiled.js"></script>
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -25,17 +34,25 @@
   <!-- Nothing is playing until a load request says otherwise, so the logo screen is the starting state. -->
   <body data-state="logo" data-ui="shown">
     <!--
-      The SDK's own player element: it owns the media element, which is what keeps playback smooth — a
-      custom MediaElement cost us "many benefits of using Web Receiver SDK", visibly. Its shadow root is
-      open, so receiver.js hides the chrome inside it (background, logo, spinner, splash, slideshow and
-      the platform's <tv-overlay-placeholder>) and only the video remains. See styleCastPlayer().
+      The picture. This element is ours: Shaka attaches to it and the SDK only watches it (we hand it
+      over as castReceiverOptions.mediaElement, and the castMediaElement class is the documented marker
+      for the same thing). Nothing draws chrome into it, so there is no shadow root to fight.
     -->
-    <cast-media-player></cast-media-player>
+    <div id="stage">
+      <video id="video" class="castMediaElement" playsinline></video>
+      <!--
+        Shaka renders text cues into this container rather than into the element's native track list,
+        so subtitles obey our CSS instead of the platform's caption settings.
+      -->
+      <div id="captions"></div>
+    </div>
 
     <div id="overlay" aria-hidden="true">
       <!-- Every state without a picture: launching, idle, stopped, errors. -->
       <section class="logoScreen">
         <img src="assets/logo.svg" alt="Budget Thuis" />
+        <!-- Only ever set when a load or the engine itself failed; empty the rest of the time. -->
+        <p class="logoScreen__error" id="error"></p>
         <!-- Which build is actually on the device. Stamped by deploy.sh; hidden when unstamped. -->
         <p class="logoScreen__build" id="build"></p>
       </section>
