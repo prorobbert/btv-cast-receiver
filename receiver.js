@@ -575,18 +575,37 @@ playerManager.setMessageInterceptor(messages.MessageType.LOAD, async loadRequest
   }
   render();
   log(`loaded — ${live ? 'live' : 'vod'}, ${media.tracks.length} track(s)`);
+  setTimeout(() => probeState('after LOAD+1s'), 1000);
   return loadRequestData;
 });
+
+/*
+ * The receiver's own overlay reads the element and is correct; what a sender sees is CAF's MediaStatus,
+ * derived from CAF's internal flags. When the two disagree — sender shows paused while the element
+ * plays — this line is how we see which side is lying. Logged on every transport command and, under
+ * debug, on a slow timer.
+ */
+function probeState(where) {
+  try {
+    log(`probe ${where}: caf=${playerManager.getPlayerState()} paused=${video.paused} ` +
+        `ready=${video.readyState} seeking=${video.seeking} t=${video.currentTime.toFixed(1)}`);
+  } catch (error) {
+    /* diagnostic only */
+  }
+}
+if (debugRequested) setInterval(() => probeState('tick'), 3000);
 
 /* --- transport: the messages the SDK used to act on itself ---------------------------------- */
 
 playerManager.setMessageInterceptor(messages.MessageType.PLAY, request => {
   video.play().catch(error => log(`play() rejected: ${error && error.message}`));
+  probeState('after PLAY');
   return request;
 });
 
 playerManager.setMessageInterceptor(messages.MessageType.PAUSE, request => {
   video.pause();
+  probeState('after PAUSE');
   return request;
 });
 
